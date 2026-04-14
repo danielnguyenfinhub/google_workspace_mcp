@@ -32,6 +32,7 @@ ENV TOOLS=""
 ENV WORKSPACE_MCP_CREDENTIALS_DIR=/app/store_creds
 ENV OAUTHLIB_INSECURE_TRANSPORT=1
 
-# Use entrypoint for the base command and CMD for args
+# main.py reads PORT from env var directly (line 267)
+# No --port CLI arg exists — only --transport, --tools, --tool-tier, etc.
 ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["uv run main.py --transport streamable-http --port ${PORT:-8000} ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
+CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
