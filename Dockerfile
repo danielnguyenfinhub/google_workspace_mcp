@@ -10,36 +10,30 @@ RUN apt-get update && apt-get install -y \
 # Install uv for faster dependency management
 RUN pip install --no-cache-dir uv
 
+# Copy project files
 COPY . .
 
 # Install Python dependencies using uv sync
 RUN uv sync --frozen --no-dev --extra disk
 
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash app \
-    && chown -R app:app /app
+# Create credentials directory (writable)
+RUN mkdir -p /app/store_creds && chmod 755 /app/store_creds
 
-# Give read and write access to the store_creds volume
-RUN mkdir -p /app/store_creds \
-    && chown -R app:app /app/store_creds \
-    && chmod 755 /app/store_creds
+# Make entrypoint executable
+RUN chmod +x /app/docker-entrypoint.sh
 
-USER app
+# Default environment variables for Railway
+ENV WORKSPACE_MCP_CREDENTIALS_DIR=/app/store_creds
+ENV OAUTHLIB_INSECURE_TRANSPORT=1
+ENV TOOL_TIER=""
+ENV TOOLS=""
 
-# Expose port (use default of 8000 if PORT not set)
+# Expose port (Railway sets PORT env var)
 EXPOSE 8000
-# Expose additional port if PORT environment variable is set to a different value
-ARG PORT
-EXPOSE ${PORT:-8000}
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD sh -c 'curl -f http://localhost:${PORT:-8000}/health || exit 1'
 
-# Set environment variables for Python startup args
-ENV TOOL_TIER=""
-ENV TOOLS=""
-
-# Use entrypoint for the base command and CMD for args
-ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
+# Use custom entrypoint that pre-seeds credentials
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
