@@ -102,7 +102,9 @@ class OAuthConfig:
         explicit_uri = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
         if explicit_uri:
             return explicit_uri
-        return f"{self.base_url}/oauth2callback"
+        # Use external URL for reverse proxy scenarios (e.g., Railway)
+        base = self.external_url if self.external_url else self.base_url
+        return f"{base}/oauth2callback"
 
     @staticmethod
     def _get_redirect_path(uri: str) -> str:
