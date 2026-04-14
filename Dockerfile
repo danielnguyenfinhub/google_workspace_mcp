@@ -26,15 +26,6 @@ RUN mkdir -p /app/store_creds \
 
 USER app
 
-# Expose port (use default of 8000 if PORT not set)
-EXPOSE 8000
-ARG PORT
-EXPOSE ${PORT:-8000}
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD sh -c 'curl -f http://localhost:${PORT:-8000}/health || exit 1'
-
 # Set environment variables
 ENV TOOL_TIER=""
 ENV TOOLS=""
@@ -43,4 +34,4 @@ ENV OAUTHLIB_INSECURE_TRANSPORT=1
 
 # Use entrypoint for the base command and CMD for args
 ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
+CMD ["uv run main.py --transport streamable-http --port ${PORT:-8000} ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
