@@ -2635,3 +2635,230 @@ async def batch_modify_gmail_message_labels(
         actions.append(f"Removed labels: {', '.join(remove_label_ids)}")
 
     return f"Labels updated for {len(message_ids)} messages: {'; '.join(actions)}"
+
+
+@server.tool()
+@handle_http_errors("forward_gmail_message", service_type="gmail")
+@require_google_service("gmail", GMAIL_SEND_SCOPE)
+async def forward_gmail_message(
+    service,
+    user_google_email: str,
+    message_id: Annotated[
+        str,
+        Field(description="Gmail message ID of the email to forward. Get this from search_gmail_messages or get_gmail_message_content."),
+    ],
+    to: Annotated[
+        str,
+        Field(description="Recipient email address(es) to forward to. Separate multiple with commas."),
+    ],
+    forward_note: Annotated[
+        Optional[str],
+        Field(description="Optional personal note or comment to add above the forwarded message body."),
+    ] = None,
+    cc: Annotated[
+        Optional[str],
+        Field(description="Optional CC email address(es). Separate multiple with commas."),
+    ] = None,
+    bcc: Annotated[
+        Optional[str],
+        Field(description="Optional BCC email address(es). Separate multiple with commas."),
+    ] = None,
+    from_email: Annotated[
+        Optional[str],
+        Field(description="Optional 'Send As' alias email address. Must be configured in Gmail settings (Settings > Accounts > Send mail as). Defaults to authenticated user's email."),
+    ] = None,
+    include_attachments: Annotated[
+        bool,
+        Field(description="Whether to re-attach all original attachments from the forwarded email. Defaults to True."),
+    ] = True,
+) -> str:
+    """
+    Forwards a Gmail message to one or more recipients, preserving the original email's
+    content and re-attaching all original file attachments.
+
+    This tool:
+    1. Fetches the original message by ID
+    2. Extracts all headers (Subject, From, To, Date)
+    3. Extracts the original body (text or HTML converted to plain text)
+    4. Downloads all original attachments from Gmail
+    5. Builds a new email with a standard Gmail-style forwarding preamble
+    6. Sends it to the specified recipient(s) with all attachments re-attached
+
+    Args:
+        message_id (str): Gmail message ID to forward. Use search_gmail_messages to find it.
+        to (str): Recipient email(s). Comma-separated for multiple.
+        forward_note (Optional[str]): Personal note added above the forwarded content.
+        cc (Optional[str]): Optional CC email(s). Comma-separated for multiple.
+        bcc (Optional[str]): Optional BCC email(s). Comma-separated for multiple.
+        from_email (Optional[str]): 'Send As' alias. Must exist in Gmail settings.
+        include_attachments (bool): Re-attach original attachments. Defaults to True.
+        user_google_email (str): The authenticated user's Google email. Required.
+
+    Returns:
+        str: Confirmation with sent message ID, subject, and attachment summary.
+
+    Examples:
+        # Simple forward
+        forward_gmail_message(message_id="18a2b3c4d5e6", to="colleague@example.com")
+
+        # Forward with a personal note
+        forward_gmail_message(
+            message_id="18a2b3c4d5e6",
+            to="colleague@example.com",
+            forward_note="FYI — see below for context."
+        )
+
+        # Forward to multiple recipients with CC
+        forward_gmail_message(
+            message_id="18a2b3c4d5e6",
+            to="manager@example.com, team@example.com",
+            cc="assistant@example.com",
+            forward_note="Please action this."
+        )
+
+        # Forward without attachments
+        forward_gmail_message(
+            message_id="18a2b3c4d5e6",
+            to="colleague@example.com",
+            include_attachments=False
+        )
+    """
+    logger.info(
+        f"[forward_gmail_message] Invoked. Forwarding message '{message_id}' to '{to}'. "
+        f"Email: '{user_google_email}', include_attachments={include_attachments}"
+    )
+
+    # Step 1: Fetch the original message in full
+    try:
+        original = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute
+        )
+    except Exception as e:
+        return f"Error: Could not fetch original message '{message_id}'. Details: {str(e)}"
+
+    payload = original.get("payload", {})
+    headers_list = payload.get("headers", [])
+
+    # Extract key headers into a dict
+    headers = {h["name"]: h["value"] for h in headers_list}
+    original_subject = headers.get("Subject", "(no subject)")
+    original_from = headers.get("From", "")
+    original_to = headers.get("To", "")
+    original_date = headers.get("Date", "")
+
+    # Step 2: Extract the original body
+    bodies = _extract_message_bodies(payload)
+    original_body_text = bodies.get("text", "")
+    if not original_body_text and bodies.get("html"):
+        original_body_text = _html_to_text(bodies["html"])
+    original_body_text = original_body_text or ""
+
+    # Step 3: Build forward subject (prefix "Fwd: " if not already present)
+    fwd_subject = original_subject
+    if not original_subject.lower().startswith("fwd:"):
+        fwd_subject = f"Fwd: {original_subject}"
+
+    # Step 4: Build the forwarding body with standard Gmail preamble
+    preamble_lines = [
+        "---------- Forwarded message ---------",
+        f"From: {original_from}",
+        f"Date: {original_date}",
+        f"Subject: {original_subject}",
+        f"To: {original_to}",
+        "",
+        original_body_text,
+    ]
+    forwarded_body = "\n".join(preamble_lines)
+    if forward_note:
+        forwarded_body = f"{forward_note}\n\n{forwarded_body}"
+
+    # Step 5: Fetch and re-encode all attachments
+    attachments_for_send: List[Dict[str, str]] = []
+    attachment_errors: List[str] = []
+
+    if include_attachments:
+        attachment_meta = _extract_attachments(payload)
+        logger.info(
+            f"[forward_gmail_message] Found {len(attachment_meta)} attachment(s) in original message."
+        )
+        for att in attachment_meta:
+            att_id = att.get("attachmentId")
+            filename = att.get("filename") or "attachment"
+            mime_type = att.get("mimeType") or "application/octet-stream"
+            if not att_id:
+                continue
+            try:
+                att_data = await asyncio.to_thread(
+                    service.users()
+                    .messages()
+                    .attachments()
+                    .get(userId="me", messageId=message_id, id=att_id)
+                    .execute
+                )
+                # Gmail returns urlsafe base64 — _prepare_gmail_message expects standard base64
+                urlsafe_data = att_data.get("data", "")
+                # Add padding if needed, then decode urlsafe, then re-encode as standard base64
+                padded = urlsafe_data + "=="
+                raw_bytes = base64.urlsafe_b64decode(padded)
+                standard_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+                attachments_for_send.append({
+                    "filename": filename,
+                    "content": standard_b64,
+                    "mime_type": mime_type,
+                })
+                logger.info(
+                    f"[forward_gmail_message] Successfully fetched attachment: {filename} ({att.get('size', 0)} bytes)"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[forward_gmail_message] Failed to fetch attachment '{filename}': {e}"
+                )
+                attachment_errors.append(filename)
+
+    # Step 6: Prepare and send the forwarded message
+    sender_email = from_email or user_google_email
+    raw_message, _, attached_count = _prepare_gmail_message(
+        subject=fwd_subject,
+        body=forwarded_body,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        from_email=sender_email,
+        attachments=attachments_for_send if attachments_for_send else None,
+    )
+
+    send_body = {"raw": raw_message}
+    try:
+        sent_message = await asyncio.to_thread(
+            service.users().messages().send(userId="me", body=send_body).execute
+        )
+    except Exception as e:
+        return f"Error: Failed to send forwarded email. Details: {str(e)}"
+
+    sent_id = sent_message.get("id", "unknown")
+
+    # Step 7: Build confirmation response
+    result_lines = [
+        "✅ Email forwarded successfully!",
+        f"Forwarded to: {to}",
+        f"Subject: {fwd_subject}",
+        f"Sent message ID: {sent_id}",
+    ]
+    if cc:
+        result_lines.append(f"CC: {cc}")
+    if bcc:
+        result_lines.append(f"BCC: {bcc}")
+    if include_attachments:
+        if attachments_for_send:
+            result_lines.append(
+                f"Attachments: {attached_count}/{len(attachments_for_send)} forwarded"
+            )
+        else:
+            result_lines.append("Attachments: none in original message")
+    if attachment_errors:
+        result_lines.append(f"⚠️ Failed to re-attach: {', '.join(attachment_errors)}")
+    return "\n".join(result_lines)
+
